@@ -1,4 +1,4 @@
-# 7 Commonly Used Crytography Algorithms with Examples in Node
+# 7 Commonly Used Cryptography Algorithms with Examples in Node
 
 ## ![](https://flagcdn.com/16x12/gb.png) ENGLISH
 
