@@ -1,0 +1,12 @@
+{
+  "name": "learn-cryptography",
+  "version": "1.0.0",
+  "repository": "https://github.com/yarkingulacti/learn-cryptography.git",
+  "author": "Yarkın Gülaçtı <yarkingulacti@outlook.com>",
+  "license": "MIT",
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.1",
+    "redis": "^4.7.0"
+  }
+}
