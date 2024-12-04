@@ -1,5 +1,6 @@
 const express = require("express");
-const cors = require("cors"); // CORS modülünü ekle
+const cors = require("cors");
+const jwt = require("jsonwebtoken");
 const {
   generateKeyPairSync,
   privateDecrypt,
@@ -11,40 +12,35 @@ const {
 } = require("crypto");
 const redis = require("redis");
 
-// Redis istemcisi oluştur
 const client = redis.createClient({
   url: "redis://default:redis@localhost:6379/2"
 });
 const app = express();
+const PORT = 8000;
+const DEFAULT_KEY_TTL_SECONDS = 10;
+const JWT_SECRET_KEY = "my_secret_key";
+const users = [
+  {
+    id: 1,
+    username: "admin"
+  },
+  {
+    id: 2,
+    username: "ertan.sinik"
+  }
+];
 
-// Bağlantı açıldığında
-client.on("connect", () => {
-  console.log("Redis sunucusuna bağlanıldı.");
-});
-
-// Hata durumunda
-client.on("error", (err) => {
-  console.error("Redis hatası:", err);
-});
-
-// Redis bağlantısını başlat
+/// Redis client başlatma
 (async () => {
+  client.on("connect", () => {
+    console.log("Redis sunucusuna bağlanıldı.");
+  });
+  client.on("error", (err) => {
+    console.error("Redis hatası:", err);
+  });
+
   await client.connect();
 })();
-
-const { privateKey, publicKey } = generateKeyPairSync("rsa", {
-  modulusLength: 2048,
-  publicKeyEncoding: {
-    type: "spki",
-    format: "pem"
-  },
-  privateKeyEncoding: {
-    type: "pkcs8",
-    format: "pem"
-  }
-});
-const PORT = 8000;
-const users = [];
 
 app.use(cors());
 app.use(
@@ -76,9 +72,6 @@ function encryptResponse(publicKeyPem, data) {
     aesKey
   );
 
-  console.log("aes key base64", aesKey.toString("base64"));
-  console.log("iv", iv.toString("base64"));
-
   // 4. Şifrelenmiş veri, şifrelenmiş anahtar ve IV'yi döndür
   return {
     data: encryptedData,
@@ -108,20 +101,72 @@ function decryptRequest(data, keyBase64, ivBase64) {
   return decrypted;
 }
 
-async function cacheOrRetreivePublicKey(username, publicKey) {
-  const redisPublicKey = await client.get(`${username}:public_key`);
+/// JWT Oluşturma
+function signJwt(payload) {
+  return jwt.sign(payload, JWT_SECRET_KEY, {
+    expiresIn: (DEFAULT_KEY_TTL_SECONDS || 2) * 60 /// varsayılan 2 dakika
+  });
+}
+
+/// JWT Doğrulama
+function verifyJwt(token) {
+  try {
+    return jwt.verify(token, JWT_SECRET_KEY);
+  } catch (err) {
+    console.error("Jwt doğrulama hatası:", err.message);
+    return null;
+  }
+}
+
+async function clearRSACacheForUser(username) {
+  await client.del(`${username}:pair:client_public_key`);
+  await client.del(`${username}:pair:server_private_key`);
+  await client.del(`${username}:pair:server_public_key`);
+}
+
+/**
+ * İstemciden gelen RSA public key'i pem formatında önbelleğe alır.
+ */
+async function cacheClientRSAPublicKey(username, publicKey) {
+  const redisPublicKey = await client.get(`${username}:pair:client_public_key`);
 
   if (!redisPublicKey) {
-    await client.set(`${username}:public_key`, publicKey, {
-      EX: 2 * 60
+    if (!publicKey) return null;
+
+    await client.set(`${username}:pair:client_public_key`, publicKey, {
+      EX: (DEFAULT_KEY_TTL_SECONDS || 2) * 60
     });
 
     return publicKey;
   } else return redisPublicKey;
 }
 
+/**
+ * Kullanıcı adına ait provider RSA anahtar eşini önbelleğe alır.
+ */
+async function cacheServerRSAPair(username, privateKey, publicKey) {
+  const redisPrivateKey = await client.get(
+    `${username}:pair:server_private_key`
+  );
+  const redisPublicKey = await client.get(`${username}:pair:server_public_key`);
+
+  if (!redisPrivateKey || !redisPublicKey) {
+    if (!privateKey || !publicKey) return { privateKey: null, publicKey: null };
+    else if (privateKey && publicKey) {
+      await client.set(`${username}:pair:server_private_key`, privateKey, {
+        EX: (DEFAULT_KEY_TTL_SECONDS || 2) * 60
+      });
+      await client.set(`${username}:pair:server_public_key`, publicKey, {
+        EX: (DEFAULT_KEY_TTL_SECONDS || 2) * 60
+      });
+
+      return { privateKey, publicKey };
+    } else return { privateKey: null, publicKey: null };
+  } else return { privateKey: redisPrivateKey, publicKey: redisPublicKey };
+}
+
 app.get("/__health", (_, res) => {
-  res.status(200).send("OK");
+  res.status(200).send("I'm alive!");
 });
 
 /**
@@ -132,87 +177,147 @@ app.get("/__health", (_, res) => {
 app.post("/login", async (req, res) => {
   console.info("/login route çalıştı");
 
-  /// İstemci tarafından gönderilen şifresiz veriyi al
-  const { public_key, username } = req.body;
-
   try {
-    /// İstemci tarafından gönderilen public key'i önbelleğe al
-    const cachedClientPublicPem = await cacheOrRetreivePublicKey(
-      username,
-      public_key
-    );
+    /// İstemci tarafından gelen şifresiz veriyi al
+    const { public_key: client_public_key, username } = req.body;
+    const dbUser = users.find((user) => user.username === username);
 
-    /// Kullanıcı adı daha önce eklenmemişse, kullanıcıyı ekle
-    if (!users.find((user) => user.username === username)) {
-      users.push({ username });
+    /// Kullanıcı adıyla eşleşen kullanıcı yoksa, hata döndür
+    if (dbUser) {
+      await clearRSACacheForUser(username);
+
+      /// Her login isteği için gelen kullanıcıya bir RSA key pair oluşturulur. Bunun sebebi kullanıcıların oturumlarının güvenliğini sağlamaktır. RSA key pair aslında bir oturum anahtarı gibi düşünülebilir.
+      const {
+        privateKey: userServerPrivateKey,
+        publicKey: userServerPublicKey
+      } = generateKeyPairSync("rsa", {
+        modulusLength: 2048,
+        publicKeyEncoding: {
+          type: "spki",
+          format: "pem"
+        },
+        privateKeyEncoding: {
+          type: "pkcs8",
+          format: "pem"
+        }
+      });
+
+      /// İstemci tarafından gönderilen public key'i önbelleğe al
+      const cachedClientPublicKeyPem = await cacheClientRSAPublicKey(
+        username,
+        client_public_key
+      );
+
+      /// Kullanıcı adına ait sunucunun RSA key pair'ini önbelleğe al
+      const { publicKey } = await cacheServerRSAPair(
+        username,
+        userServerPrivateKey,
+        userServerPublicKey
+      );
 
       res.status(200).send(
-        encryptResponse(cachedClientPublicPem, {
-          message: "Kaydınız başarılı. Hoş geldiniz!",
-          public_key: publicKey
+        /// İstemcinin RSA public key'i ile şifrelenmiş response'u döndür
+        encryptResponse(cachedClientPublicKeyPem, {
+          message: "Hoş geldiniz!",
+          data: {
+            public_key: publicKey,
+            token: signJwt({ username, id: dbUser.id })
+          }
         })
       );
-    }
-    /// Kullanıcı adı daha önce eklenmişse, hata döndür
+    } /// Kullanıcı adıyla eşleşmesi beklenen RSA public key gelen istekte yoksa, hata döndür
+    else if (!client_public_key)
+      res.status(424).send({
+        message: "Giriş isteğinize dair bilgiler eksik.",
+        error: "424 Failed Dependency"
+      });
+    /// Kullanıcı bulunamadı
     else
-      res.status(409).send(
-        encryptResponse(cachedClientPublicPem, {
-          message:
-            "Kullanıcı zaten var. Lütfen başka bir kullanıcı adıyla deneyin.",
-          public_key: publicKey
-        })
-      );
+      res.status(404).send({
+        message: "Bilgileniriz eksik ya da hatalı.",
+        error: "404 Not Found"
+      });
   } catch (error) {
     console.info("/login route hatası");
     console.error(error);
 
-    res.status(500);
+    res.status(500).send({
+      message:
+        "Giriş yaparken bir hata oluştu, lütfen sistem destek ekibinize danışın.",
+      error: "500 Internal Server Error"
+    });
   }
 });
 
 app.post("/profile", async (req, res) => {
   console.info("/profile route çalıştı");
 
-  /// İstemci tarafından gelen şifreli verileri al
-  const { data, key, iv } = req.body;
-
-  console.log("Gelen body: ", req.body);
-
   try {
-    const aesKey = privateDecrypt(
-      {
-        key: privateKey,
-        padding: constants.RSA_PKCS1_OAEP_PADDING
-      },
-      Buffer.from(key, "base64")
-    );
+    /// İstemci tarafından gelen şifreli verileri al
+    const { data, key, iv } = req.body;
 
-    console.log("Gelen aes key (Base64): ", aesKey.toString("base64"));
+    /// Header'dan JWT token'ı al
+    const [, jwtToken] = req.headers.authorization.split(" ");
 
-    const decryptedData = JSON.parse(decryptRequest(data, aesKey, iv));
-    console.log(
-      "Çözülen client verisi (JSON): " + JSON.stringify(decryptedData, null, 2)
-    );
+    /// JWT token'ı doğrula
+    const sessionObject = verifyJwt(jwtToken);
 
-    const { username } = decryptedData;
-    const publicKey = await cacheOrRetreivePublicKey(username);
-
-    if (!publicKey)
-      res.status(424).send({
-        message: "Oturumunuza dair bilgiler eksik, lütfen tekrar giriş yapın.",
-        error: "424 Failed Dependency"
+    /// JWT token'ı doğrulanamazsa, hata döndür
+    if (!sessionObject)
+      res.status(401).send({
+        message: "Oturumunuz geçersiz, lütfen tekrar giriş yapın.",
+        error: "401 Unauthorized"
       });
-    else
-      res.status(200).send(
-        encryptResponse(publicKey, {
-          message: "Profilin çok güzel!"
-        })
-      );
+    else {
+      const { privateKey } = await cacheServerRSAPair(sessionObject.username);
+
+      if (!privateKey)
+        res.status(424).send({
+          message:
+            "Oturumunuza dair bilgiler eksik, lütfen tekrar giriş yapın. B",
+          error: "424 Failed Dependency"
+        });
+      else {
+        const aesKey = privateDecrypt(
+          {
+            key: privateKey,
+            padding: constants.RSA_PKCS1_OAEP_PADDING
+          },
+          Buffer.from(key, "base64")
+        );
+        const decryptedData = JSON.parse(decryptRequest(data, aesKey, iv));
+
+        console.log(
+          "Profile Request Data: ",
+          JSON.stringify(decryptedData, null, 2)
+        );
+
+        const clientRSAPublicKey = await cacheClientRSAPublicKey(
+          sessionObject.username
+        );
+
+        if (!clientRSAPublicKey)
+          res.status(424).send({
+            message:
+              "Oturumunuza dair bilgiler eksik, lütfen tekrar giriş yapın. A",
+            error: "424 Failed Dependency"
+          });
+        else
+          res.status(200).send(
+            encryptResponse(clientRSAPublicKey, {
+              message: "Profilin çok güzel!"
+            })
+          );
+      }
+    }
   } catch (error) {
     console.info("/profile route hatası");
     console.error(error);
 
-    res.status(500);
+    res.status(500).send({
+      message: "Bir hata oluştu, lütfen sistem destek ekibinize danışın.",
+      error: "500 Internal Server Error"
+    });
   }
 });
 
